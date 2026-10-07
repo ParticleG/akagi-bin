@@ -1,0 +1,246 @@
+name: Update, build, and publish AUR package
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/aur-publish.yml
+      - .gitignore
+      - .SRCINFO
+      - PKGBUILD
+      - README.md
+      - akagi
+      - akagi.desktop
+  pull_request:
+    paths:
+      - .github/workflows/aur-publish.yml
+      - .SRCINFO
+      - PKGBUILD
+      - akagi
+      - akagi.desktop
+  schedule:
+    - cron: '17 */6 * * *'
+  repository_dispatch:
+    types:
+      - upstream-release
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: Publish the current recipe even when the upstream version is unchanged
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aur-publish-akagi-bin-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PACKAGE_NAME: akagi-bin
+  UPSTREAM_REPOSITORY: shinkuan/Akagi
+
+jobs:
+  update-and-publish:
+    name: Update, verify, and publish package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Download latest upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_json="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest")"
+          tag="$(jq -r '.tag_name // empty' <<<"$release_json")"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'Unsupported upstream release tag: %s\n' "$tag" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          asset="akagi-${version}-linux-x64.zip"
+          if ! jq -e --arg asset "$asset" \
+            '.assets[] | select(.name == $asset)' \
+            <<<"$release_json" >/dev/null; then
+            printf 'Release %s does not contain %s\n' "$tag" "$asset" >&2
+            exit 1
+          fi
+
+          download_dir="$RUNNER_TEMP/akagi-release"
+          mkdir -p "$download_dir"
+          gh release download "$tag" \
+            --repo "$UPSTREAM_REPOSITORY" \
+            --pattern "$asset" \
+            --dir "$download_dir" \
+            --clobber
+          curl --fail --location --silent --show-error \
+            --output "$download_dir/akagi.png" \
+            "https://raw.githubusercontent.com/$UPSTREAM_REPOSITORY/$tag/icons/128x128@2x.png"
+
+          cp "$download_dir/$asset" "$PACKAGE_NAME-$version.zip"
+          cp "$download_dir/akagi.png" "$PACKAGE_NAME-$version.png"
+          {
+            printf 'version=%s\n' "$version"
+            printf 'archive_sha256=%s\n' "$(sha256sum "$PACKAGE_NAME-$version.zip" | cut -d ' ' -f 1)"
+            printf 'icon_sha256=%s\n' "$(sha256sum "$PACKAGE_NAME-$version.png" | cut -d ' ' -f 1)"
+            printf 'launcher_sha256=%s\n' "$(sha256sum akagi | cut -d ' ' -f 1)"
+            printf 'desktop_sha256=%s\n' "$(sha256sum akagi.desktop | cut -d ' ' -f 1)"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Update package recipe
+        env:
+          ARCHIVE_SHA256: ${{ steps.upstream.outputs.archive_sha256 }}
+          ICON_SHA256: ${{ steps.upstream.outputs.icon_sha256 }}
+          LAUNCHER_SHA256: ${{ steps.upstream.outputs.launcher_sha256 }}
+          DESKTOP_SHA256: ${{ steps.upstream.outputs.desktop_sha256 }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("PKGBUILD")
+          text = path.read_text()
+          version = os.environ["VERSION"]
+          checksums = tuple(
+              os.environ[key]
+              for key in (
+                  "ARCHIVE_SHA256",
+                  "ICON_SHA256",
+                  "LAUNCHER_SHA256",
+                  "DESKTOP_SHA256",
+              )
+          )
+
+          def require_match(pattern):
+              match = re.search(pattern, text, flags=re.MULTILINE)
+              if match is None:
+                  raise SystemExit(f"Missing required PKGBUILD field: {pattern!r}")
+              return match
+
+          old_version = require_match(r"^pkgver=(.+)$").group(1)
+          old_pkgrel = int(require_match(r"^pkgrel=([0-9]+)$").group(1))
+          checksum_block = require_match(r"^sha256sums=\(\n(?:  '[0-9a-f]{64}'\n){4}\)")
+          old_checksums = tuple(re.findall(r"'([0-9a-f]{64})'", checksum_block.group(0)))
+          if old_version != version:
+              pkgrel = 1
+          elif old_checksums != checksums:
+              pkgrel = old_pkgrel + 1
+          else:
+              pkgrel = old_pkgrel
+
+          for pattern, replacement in (
+              (r"^pkgver=.*$", f"pkgver={version}"),
+              (r"^pkgrel=.*$", f"pkgrel={pkgrel}"),
+          ):
+              text, count = re.subn(pattern, replacement, text, count=1, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f"Expected one match for {pattern!r}, found {count}")
+
+          new_block = "sha256sums=(\n" + "".join(f"  '{value}'\n" for value in checksums) + ")"
+          text = text.replace(checksum_block.group(0), new_block, 1)
+          path.write_text(text)
+          PY
+
+      - name: Generate SRCINFO, build, and validate package
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          build_dir="$RUNNER_TEMP/package-build"
+          mkdir -p "$build_dir"
+          cp \
+            PKGBUILD akagi akagi.desktop \
+            "$PACKAGE_NAME-$VERSION.zip" \
+            "$PACKAGE_NAME-$VERSION.png" \
+            "$build_dir/"
+
+          docker run --rm \
+            --env BUILD_UID="$(id -u)" \
+            --volume "$build_dir:/pkg" \
+            --workdir /pkg \
+            archlinux:base-devel \
+            bash -euc '
+              pacman -Syu --needed --noconfirm \
+                desktop-file-utils gtk3 hicolor-icon-theme shellcheck webkit2gtk-4.1
+              useradd --uid "$BUILD_UID" --create-home builder
+              shellcheck akagi
+              desktop-file-validate akagi.desktop
+              runuser -u builder -- makepkg --printsrcinfo >.SRCINFO
+              runuser -u builder -- makepkg --verifysource --noconfirm
+              runuser -u builder -- makepkg --cleanbuild --force --noconfirm
+              pacman -U --noconfirm ./*.pkg.tar.zst
+              desktop-file-validate /usr/share/applications/akagi.desktop
+              runuser -u builder -- env LD_BIND_NOW=1 akagi --help
+              /opt/akagi/runtime/python/x86_64-unknown-linux-gnu/bin/python3.12 \
+                -c "import bz2, ctypes, lzma, sqlite3, ssl; print(ssl.OPENSSL_VERSION)"
+              /opt/akagi/runtime/uv/x86_64-unknown-linux-gnu/uv --version
+            '
+          cp "$build_dir/.SRCINFO" .SRCINFO
+
+      - name: Upload built package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: akagi-bin-${{ steps.upstream.outputs.version }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/package-build/*.pkg.tar.zst
+          if-no-files-found: error
+
+      - name: Detect recipe changes
+        id: changes
+        run: |
+          if git diff --quiet -- PKGBUILD .SRCINFO; then
+            echo 'changed=false' >>"$GITHUB_OUTPUT"
+          else
+            echo 'changed=true' >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit updated recipe
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name 'ParticleG'
+          git config user.email 'particle_g@outlook.com'
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update akagi to ${VERSION}"
+          gh auth setup-git
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Publish to AUR
+        if: >-
+          github.ref == 'refs/heads/main' &&
+          github.event_name != 'pull_request' &&
+          (steps.changes.outputs.changed == 'true' ||
+           github.event_name == 'push' ||
+           github.event_name == 'schedule' ||
+           github.event_name == 'repository_dispatch' ||
+           github.event.inputs.force_publish == 'true')
+        uses: KSXGitHub/github-actions-deploy-aur@da03e160361ce01bf087e790b6ffd196d7dccff7 # v4.1.3
+        with:
+          pkgname: akagi-bin
+          pkgbuild: ./PKGBUILD
+          assets: |
+            .gitignore
+            README.md
+            akagi
+            akagi.desktop
+          post_process: git config core.filemode true && chmod 755 akagi
+          commit_username: ParticleG
+          commit_email: particle_g@outlook.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ steps.upstream.outputs.version }}"
